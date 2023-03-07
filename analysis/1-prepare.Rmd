@@ -1,0 +1,224 @@
+---
+title: "1-explore"
+author: "Bernard"
+date: "2021-11-18"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+# Load
+
+```{r}
+library (tidyverse)
+library (rmatio)
+library (pracma)
+library (ggforce)
+
+```
+
+# Import
+
+```{r}
+path2file1 <- c("../../mocap_database/data_cheng/MAT/MAT/Right_vs_Left")
+list_of_files <- list.files (path2file1)
+
+df1 <- list_of_files %>%
+  map (~read.mat (file.path(path2file1, .)))
+
+names (df1) <- str_remove (list_of_files, ".mat")
+
+path2file2 <- c("../../mocap_database/data_cheng/MAT/MAT/Pre5k_vs_Post5k")
+list_of_files <- list.files (path2file2)
+
+df2 <- list_of_files %>%
+  map (~read.mat (file.path(path2file2, .)))
+
+names (df2) <- str_remove (list_of_files, ".mat")
+```
+
+
+
+# Reshape
+
+```{r}
+df1_vars <- names(df1)
+df1_vars <- str_remove(df1_vars, "_LeftRight_")
+session <- unlist (str_extract_all(df1_vars, "Post|Pre"))
+gait <- unlist (str_extract_all(df1_vars, "Walk|Run"))
+jt <- unlist (str_extract_all(df1_vars, "Hip|Knee|Ankle"))
+axes <- unlist (str_extract_all(df1_vars, "X|Y|Z"))
+varz <- str_remove_all(df1_vars, paste(unique (c(session, gait, jt, axes)), collapse = "|"))
+varz <- ifelse (varz =="", "ang", varz)
+
+reshape_mat <- function (x) {
+  x[[1]] <- as.data.frame(t(x[[1]] ))
+  x[[2]] <- as.data.frame(t(x[[2]] ))
+  x1 <- bind_rows(x)
+  x2 <- data.frame (subj = rep (1:20, 2),
+                    side = rep (c("l", "r"), each = 20))
+  x2 <- bind_cols(x2, x1)
+  x2
+}
+
+df1 <- df1 %>%
+  map (reshape_mat)
+
+df2 <- tibble(session = session,
+                  gait = gait,
+                  jt = jt,
+                  axes = axes,
+                  varz = varz,
+              data = df1)
+
+df3 <- unnest (df2, data)
+
+df_run <- df3 %>%
+  filter (gait == "Run") %>%
+  select_if(~ !any(is.na(.)))
+
+
+df_walk <- df3 %>%
+  filter (gait != "Run") 
+
+df_walk_stance <- df_walk
+
+for (n in 1:nrow (df_walk)) {
+  
+  y <- df_walk[n, 8:68] %>%
+    as.numeric()
+  x <- 1:61
+  x1 <-  seq(1, 61, length.out = 51)
+  y1 <- interp1(x, y, x1, method = "spline")
+  
+  df_walk_stance[n, 8:58] <- t(y1)
+}
+
+df_walk_stance <- df_walk_stance %>%
+  select (-c(`V52`:`V101`))
+
+saveRDS(list (df_walk = df_walk,
+              df_run = df_run,
+              df_walk_stance = df_walk_stance),
+        "data/tidy_data.RDS")
+```
+
+
+# Plot
+
+```{r}
+
+create_plot <- function (x = df_run, joint = "Ankle", ax = "X", variables = "ang") {
+  
+  
+  df_plot <- x %>%
+    filter (jt == joint & axes == ax & varz == variables) 
+  
+  ylab_label <- paste0( c(joint, ax, variables), collapse = "_")
+  
+  l_df <- df_plot %>%
+    filter (side == "l") %>%
+    select (starts_with("V", ignore.case = FALSE))
+  
+  r_df <- df_plot %>%
+    filter (side == "r") %>%
+    select (starts_with("V", ignore.case = FALSE))  
+  
+  f1 <- ggmatplot(t(l_df), plot_type = "line", color = "black", linetype = 1) +
+    theme(legend.position = "none") +
+    ylab (ylab_label) +
+    xlab ("Cycle")
+  
+  f2 <- ggmatplot(t(r_df), plot_type = "line", color = "black", linetype = 1) +
+    theme(legend.position = "none") +
+    ylab (ylab_label) +
+    xlab ("Cycle")
+  
+  cowplot::plot_grid(f1, f2, labels = c("L", "R"))
+  
+}
+
+
+```
+
+# Run plot
+
+```{r}
+# Ankle angle and JCF
+
+f1 <- create_plot (x = df_run, joint = "Ankle", ax = "X", variables = "ang")
+f2 <- create_plot (x = df_run, joint = "Ankle", ax = "X", variables = "JR")
+f3 <- create_plot (x = df_run, joint = "Ankle", ax = "Y", variables = "JR")
+f4 <- create_plot (x = df_run, joint = "Ankle", ax = "Z", variables = "JR")
+
+tiff ("output/run_ankle_plot.tiff", height = 8, width = 6, res = 100, units = "in")
+cowplot::plot_grid (f1, f2, f3, f4, ncol = 1)
+dev.off()
+
+# knee angle and JCF
+
+f1 <- create_plot (x = df_run, joint = "Knee", ax = "X", variables = "ang")
+f2 <- create_plot (x = df_run, joint = "Knee", ax = "Y", variables = "ang")
+f3 <- create_plot (x = df_run, joint = "Knee", ax = "Z", variables = "ang")
+f4 <- create_plot (x = df_run, joint = "Knee", ax = "X", variables = "JR")
+f5 <- create_plot (x = df_run, joint = "Knee", ax = "Y", variables = "JR")
+f6 <- create_plot (x = df_run, joint = "Knee", ax = "Z", variables = "JR")
+
+tiff ("output/run_knee_plot.tiff", height = 12, width = 6, res = 100, units = "in")
+  cowplot::plot_grid (f1, f2, f3, f4, f5, f6, ncol = 1)
+dev.off()
+
+# hip angle and JCF
+
+f1 <- create_plot (x = df_run, joint = "Hip", ax = "X", variables = "ang")
+f2 <- create_plot (x = df_run, joint = "Hip", ax = "Y", variables = "ang")
+f3 <- create_plot (x = df_run, joint = "Hip", ax = "Z", variables = "ang")
+f4 <- create_plot (x = df_run, joint = "Hip", ax = "X", variables = "JR")
+f5 <- create_plot (x = df_run, joint = "Hip", ax = "Y", variables = "JR")
+f6 <- create_plot (x = df_run, joint = "Hip", ax = "Z", variables = "JR")
+
+tiff ("output/run_hip_plot.tiff", height = 12, width = 6, res = 100, units = "in")
+  cowplot::plot_grid (f1, f2, f3, f4, f5, f6, ncol = 1)
+dev.off()
+```
+
+# Walkplot
+
+```{r}
+# Ankle angle and JCF
+
+f1 <- create_plot (x = df_walk, joint = "Ankle", ax = "X", variables = "ang")
+f2 <- create_plot (x = df_walk, joint = "Ankle", ax = "X", variables = "JR")
+f3 <- create_plot (x = df_walk, joint = "Ankle", ax = "Y", variables = "JR")
+f4 <- create_plot (x = df_walk, joint = "Ankle", ax = "Z", variables = "JR")
+
+tiff ("output/walk_ankle_plot.tiff", height = 8, width = 6, res = 100, units = "in")
+cowplot::plot_grid (f1, f2, f3, f4, ncol = 1)
+dev.off()
+
+# knee angle and JCF
+
+f1 <- create_plot (x = df_walk, joint = "Knee", ax = "X", variables = "ang")
+f2 <- create_plot (x = df_walk, joint = "Knee", ax = "Y", variables = "ang")
+f3 <- create_plot (x = df_walk, joint = "Knee", ax = "Z", variables = "ang")
+f4 <- create_plot (x = df_walk, joint = "Knee", ax = "X", variables = "JR")
+f5 <- create_plot (x = df_walk, joint = "Knee", ax = "Y", variables = "JR")
+f6 <- create_plot (x = df_walk, joint = "Knee", ax = "Z", variables = "JR")
+
+tiff ("output/walk_knee_plot.tiff", height = 12, width = 6, res = 100, units = "in")
+  cowplot::plot_grid (f1, f2, f3, f4, f5, f6, ncol = 1)
+dev.off()
+
+# hip angle and JCF
+
+f1 <- create_plot (x = df_walk, joint = "Hip", ax = "X", variables = "ang")
+f2 <- create_plot (x = df_walk, joint = "Hip", ax = "Y", variables = "ang")
+f3 <- create_plot (x = df_walk, joint = "Hip", ax = "Z", variables = "ang")
+f4 <- create_plot (x = df_walk, joint = "Hip", ax = "X", variables = "JR")
+f5 <- create_plot (x = df_walk, joint = "Hip", ax = "Y", variables = "JR")
+f6 <- create_plot (x = df_walk, joint = "Hip", ax = "Z", variables = "JR")
+
+tiff ("output/walk_hip_plot.tiff", height = 12, width = 6, res = 100, units = "in")
+  cowplot::plot_grid (f1, f2, f3, f4, f5, f6, ncol = 1)
+dev.off()
+```

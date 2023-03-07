@@ -1,0 +1,805 @@
+---
+title: "1-explore"
+author: "Bernard"
+date: "2021-11-18"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+# Load
+
+```{r}
+
+reticulate::use_condaenv("tf-gpu")
+tsai <- reticulate::import("tsai.all")
+
+library (reticulate)
+library (tidyverse)
+library (rmatio)
+library (pracma)
+library (ggforce)
+
+```
+
+
+# Performance metrics for time series
+```{r}
+# measures defined in Ren et al. 2008
+# with equidistant grid 
+
+integrate_fun <- function(X, 
+                          n = nrow(X),
+                          nxgrid = ncol(X), 
+                          xind = matrix(as.vector(1:ncol(X)), 
+                                        nrow=nrow(X), 
+                                        ncol=nxgrid, 
+                                        byrow=T),
+                          integration = "simpson")
+{
+  
+  # copied from refund:::pffr
+  # credits to Fabian Scheipl
+  L <- switch(integration,
+              "simpson" = {
+                # \int^b_a f(t) dt = (b-a)/gridlength/3 * [f(a) + 4*f(t_1) + 2*f(t_2) + 4*f(t_3) +
+                # 2*f(t_3) +...+ f(b)]
+                ((xind[,nxgrid]-xind[,1])/nxgrid)/3 *
+                  matrix(c(1, rep(c(4, 2), length=nxgrid-2), 1), nrow=n, ncol=nxgrid, byrow=T)
+              },
+              "trapezoidal" = {
+                # \int^b_a f(t) dt = .5* sum_i (t_i - t_{i-1}) f(t_i) + f(t_{i-1}) =
+                #	(t_2 - t_1)/2 * f(a=t_1) + sum^{nx-1}_{i=2} ((t_i - t_i-1)/2 + (t_i+1 - t_i)/2) * f(t_i) + 
+                # ... +
+                #			+ (t_nx - t_{nx-1})/2 * f(b=t_n)
+                diffs <- t(apply(xind, 1, diff))
+                .5 * cbind(diffs[,1],
+                           t(apply(diffs, 1, filter, filter=c(1,1)))[,-(nxgrid-1)],
+                           diffs[,(nxgrid-1)])
+              },
+              "riemann" = {
+                # simple quadrature rule:
+                # \int^b_a f(t) dt = sum_i (t_i-t_{i-1})*(f(t_i))
+                diffs <- t(apply(xind, 1, diff))
+                #assume delta(t_0=a, t_1) = avg. delta
+                cbind(rep(mean(diffs),n), diffs)
+              }
+  )
+  
+  apply(L*X,1,sum)
+  
+}
+
+RMSE <- function(actual_mat, pred_mat, time_diff = ncol(actual_mat)-1, ...)
+{
+  
+  sqrt(integrate_fun((actual_mat - pred_mat)^2, ...)/time_diff)
+  
+}
+
+relRMSE <- function(actual_mat, pred_mat, ...)
+{
+  
+  nom <- RMSE(actual_mat, pred_mat, ...)
+  denom <- 0.5 * (apply(actual_mat, 1, function(x) diff(range(x))) + 
+                    apply(pred_mat, 1, function(x) diff(range(x))))
+  return((nom/denom)*100)
+  
+}
+
+cor_fun <- function(actual_mat, pred_mat)
+{
+  
+  sapply(1:nrow(actual_mat), function(i) cor(actual_mat[i,], pred_mat[i,])) 
+  
+}
+
+all_measures <- function(actual_mat, pred_mat, ...)
+{
+  
+  data.frame(RMSE = RMSE(actual_mat, pred_mat, ...),
+             relRMSE = relRMSE(actual_mat, pred_mat, ...),
+             cor = cor_fun(actual_mat, pred_mat))
+  
+}
+```
+
+# Import clean
+```{r}
+df_list <- readRDS("data/tidy_data.RDS")
+list2env(df_list,globalenv())
+```
+
+# Prepare to array
+
+```{r}
+row_ids <- df_walk %>%
+  filter (jt == "Ankle" & axes == "Z", varz == "JR") %>%
+  unite (col = "idx", subj, side, session, sep =  "_") %>%
+  pull (idx)
+```
+
+
+## Running
+
+```{r}
+predictors <- df_run %>%
+  filter (varz == "ang")
+
+predictors_nest <- predictors %>%
+  unite (col = "jt_axes", jt, axes, sep = "_") %>%
+  group_by (jt_axes)
+  
+predictors_split <- predictors_nest %>%
+  group_split()
+
+names (predictors_split) <- pull (group_keys(predictors_nest))
+
+predictors_split <- predictors_split %>%
+  map (~ .x  %>% dplyr::select (starts_with("V", ignore.case = FALSE)) %>% as.matrix)
+
+predictors <- array(NA,c(nrow (predictors_split[[1]]),ncol (predictors_split[[1]]),length (predictors_split)))
+
+for (n in seq_along(predictors_split)) {
+  
+  predictors[,,n] <- predictors_split [[n]]
+}
+
+predictors <- aperm (predictors, c(1, 3, 2))# fastai 
+
+outcomes <- df_run %>%
+  filter (varz != "ang")
+
+outcomes_nest <- outcomes %>%
+  unite (col = "jt_axes_varz", jt, axes, varz, sep = "_") %>%
+  group_by (jt_axes_varz)
+  
+outcomes_split <- outcomes_nest %>%
+  group_split()
+
+names (outcomes_split) <- pull (group_keys(outcomes_nest))
+
+outcomes_split <- outcomes_split %>%
+  map (~ .x  %>% dplyr::select (starts_with("V", ignore.case = FALSE)) %>% as.matrix)
+
+outcomes <- array(NA,c(nrow (predictors_split[[1]]),ncol (predictors_split[[1]]),length (outcomes_split)))
+
+for (n in seq_along(outcomes_split)) {
+  
+  outcomes[,,n] <- outcomes_split [[n]]
+}
+
+outcome_run <- outcomes
+pred_run <- predictors
+
+```
+
+# Walking
+
+```{r}
+df_walk <- df_walk_stance
+
+predictors <- df_walk %>%
+  filter (varz == "ang")
+
+predictors_nest <- predictors %>%
+  unite (col = "jt_axes", jt, axes, sep = "_") %>%
+  group_by (jt_axes)
+  
+predictors_split <- predictors_nest %>%
+  group_split()
+
+names (predictors_split) <- pull (group_keys(predictors_nest))
+
+predictors_split <- predictors_split %>%
+  map (~ .x  %>% dplyr::select (starts_with("V", ignore.case = FALSE)) %>% as.matrix)
+
+predictors <- array(NA,c(nrow (predictors_split[[1]]),ncol (predictors_split[[1]]),length (predictors_split)))
+
+for (n in seq_along(predictors_split)) {
+  
+  predictors[,,n] <- predictors_split [[n]]
+}
+
+predictors <- aperm (predictors, c(1, 3, 2))# fastai 
+
+outcomes <- df_walk %>%
+  filter (varz != "ang")
+
+outcomes_nest <- outcomes %>%
+  unite (col = "jt_axes_varz", jt, axes, varz, sep = "_") %>%
+  group_by (jt_axes_varz)
+  
+outcomes_split <- outcomes_nest %>%
+  group_split()
+
+names (outcomes_split) <- pull (group_keys(outcomes_nest))
+
+outcomes_split <- outcomes_split %>%
+  map (~ .x  %>% dplyr::select (starts_with("V", ignore.case = FALSE)) %>% as.matrix)
+
+outcomes <- array(NA,c(nrow (predictors_split[[1]]),ncol (predictors_split[[1]]),length (outcomes_split)))
+
+for (n in seq_along(outcomes_split)) {
+  
+  outcomes[,,n] <- outcomes_split [[n]]
+}
+
+outcome_walk <- outcomes
+pred_walk <- predictors
+```
+
+# Axes
+
+X - anterior posterior axis
+Y - superior axis
+Z - medial lateral axis
+
+```{r}
+outcome_names <- names (outcomes_split)
+```
+
+# Split
+
+## Generate split indices
+```{r}
+obs = 20
+## 80% train, 10% test, 10% validate
+smp_size <- floor(0.90 * obs )
+val_size <- floor(0.10 * smp_size)
+
+
+set.seed(123)
+train_ind <- sample(seq_len(obs), size = smp_size)
+test_ind <- setdiff (seq_len(obs), train_ind)
+val_ind <- sample(train_ind, size = val_size)
+train_ind <- setdiff (train_ind, val_ind)
+
+# Check
+length (train_ind) + length (val_ind) + length (test_ind) == obs
+
+val_ind2 <- paste0(val_ind, "_", c("l_Post", "r_Post", "l_Pre", "r_Pre"))
+test_ind2 <- as.vector(outer(test_ind, c("l_Post", "r_Post", "l_Pre", "r_Pre"), paste, sep="_"))
+train_ind2 <- row_ids[!row_ids %in% c(val_ind2, test_ind2) ]
+
+length (train_ind2) + length (val_ind2) + length (test_ind2) == length (row_ids)
+
+
+train_ind <- which (row_ids %in% train_ind2)
+val_ind <- which (row_ids %in% val_ind2)
+test_ind <- which (row_ids %in% test_ind2)
+```
+
+
+
+# Deep learning models
+
+## Set up data
+
+```{r}
+# Walk
+covz_walk <- pred_walk
+x_train_walk <- covz_walk [train_ind, , ]
+x_val_walk <- covz_walk [val_ind, , ]
+x_test_walk <- covz_walk [test_ind, , ]
+
+# Run
+covz_run <- pred_run
+x_train_run <- covz_run [train_ind, , ]
+x_val_run <- covz_run [val_ind, , ]
+x_test_run <- covz_run [test_ind, , ]
+
+```
+
+
+## Train models
+
+```{r, eval = FALSE}
+
+jr_var <- grep("JR", outcome_names, value = TRUE)
+
+n_epoch <- c(25L, 50L, 100L, 200L, 500L, 1000L)
+
+#train on walk, val on run
+
+pred_list_walk <- vector ("list", length (jr_var))
+
+for (n in seq_along(pred_list_walk)) {
+  
+  pred_list_walk[[n]] <- vector ("list", length (n_epoch))
+
+  
+}
+pred_list_run <- pred_list_walk
+
+for (m in seq_along (jr_var)) {
+  
+    outcome_id <- grep (jr_var[[m]], outcome_names)
+    
+    o_walk <- outcome_walk[,,outcome_id]
+    y_train_walk <- o_walk [train_ind, ]
+    y_val_walk <- o_walk [val_ind, ]
+    y_test_walk <- o_walk [test_ind, ]
+    
+    splits = tsai$combine_split_data(list (x_train_walk , x_val_walk), list (y_train_walk, y_val_walk))
+    tfms  = list (NULL, tsai$TSRegression)
+    dls = tsai$get_ts_dls(splits[[1]], splits[[2]], splits=splits[[3]], tfms=tfms, bs=34L)
+    learn = tsai$ts_learner(dls, arch=tsai$XCM, metrics= tsai$rmse)
+
+    for (n in seq_along (n_epoch)) {
+    
+      learn$fit(n_epoch[[n]], lr=1e-5)
+      pred_list_run [[m]][[n]] <- learn$get_X_preds(X = x_test_run)[[3]]
+  }
+  
+}
+
+#train on run, val on walk
+
+
+for (m in seq_along (jr_var)) {
+  
+    outcome_id <- grep (jr_var[[m]], outcome_names)
+    
+    o_run <- outcome_run[,,outcome_id]
+    y_train_run <- o_run [train_ind, ]
+    y_val_run <- o_run [val_ind, ]
+    y_test_run <- o_run [test_ind, ]
+    
+    splits = tsai$combine_split_data(list (x_train_run , x_val_run), list (y_train_run, y_val_run))
+    tfms  = list (NULL, tsai$TSRegression)
+    dls = tsai$get_ts_dls(splits[[1]], splits[[2]], splits=splits[[3]], tfms=tfms, bs=34L)
+    learn = tsai$ts_learner(dls, arch=tsai$XCM, metrics= tsai$rmse)
+
+    for (n in seq_along (n_epoch)) {
+    
+      learn$fit(n_epoch[[n]], lr=1e-5)
+      pred_list_walk [[m]][[n]] <- learn$get_X_preds(X = x_test_walk)[[3]]
+
+  }
+  
+}
+
+
+pred_list_walk2 <- vector ("list", length (jr_var))
+
+for (n in seq_along(pred_list_walk2 )) {
+  
+  pred_list_walk2[[n]] <- vector ("list", length (n_epoch))
+
+  
+}
+
+pred_list_run2 <- pred_list_walk2
+
+
+for (m in seq_along (jr_var)) {
+  
+    for (n in seq_along (n_epoch)) {
+      
+      for (o in 1:length(pred_list_walk [[m]][[n]])) {
+    
+        pred_list_walk2 [[m]][[n]][[o]] <- pred_list_walk[[m]][[n]][[o-1]]
+        pred_list_run2 [[m]][[n]][[o]] <- pred_list_run[[m]][[n]][[o-1]]
+      }
+      
+    }
+  
+}
+
+saveRDS(list (pred_list_runwalk2 = pred_list_walk2,
+              pred_list_walkrun2 = pred_list_run2),
+        "output/res_difftasks.RDS")
+
+```
+
+```{r}
+
+res2 <- readRDS("output/res_difftasks.RDS")
+
+# Get errors
+
+error_walk <- res2$pred_list_runwalk2 %>%
+  map (~.x %>% map (~ matrix (unlist(.), length (.), 51, byrow = TRUE)))
+names(error_walk) <- jr_var
+
+test_ave_walk <- error_walk
+
+for (m in 1:length (error_walk)){
+  
+  var_name <- jr_var[[m]]
+  
+  for (n in 1:length (error_walk[[m]])) {
+    
+    y_test_walk <- outcome_walk[test_ind, ,grep (var_name, outcome_names)]
+    test_ave_walk[[m]][[n]] <- apply (y_test_walk, 2, mean)
+    
+    error_walk[[m]][[n]] <- all_measures (actual_mat = y_test_walk,
+              pred_mat = error_walk[[m]][[n]]) %>%  apply (2, mean)
+  }
+  
+  names(error_walk[[m]]) <-names(test_ave_walk[[m]]) <- c("25", "50", "100", "200", "500", "1000")
+  
+}
+
+# Run
+
+error_run <- res2$pred_list_walkrun2 %>%
+  map (~.x %>% map (~ matrix (unlist(.), length (.), 51, byrow = TRUE)))
+names(error_run) <- jr_var
+
+test_ave_run <- error_run
+
+for (m in 1:length (error_run)){
+  
+  var_name <- jr_var[[m]]
+  
+  for (n in 1:length (error_run[[m]])) {
+    
+        y_test_run <- outcome_run[test_ind, ,grep (var_name, outcome_names)]
+        test_ave_run[[m]][[n]] <- apply (y_test_run, 2, mean)
+    
+    error_run[[m]][[n]] <- all_measures (actual_mat = y_test_run,
+              pred_mat = error_run[[m]][[n]]) %>%  apply (2, mean)
+  }
+  
+  names(error_run[[m]]) <- names(test_ave_run[[m]]) <-c("25", "50", "100", "200", "500", "1000")
+}
+
+
+
+error_walk <- error_walk %>%
+  map (~bind_rows(., .id = "epochs")) %>%
+  bind_rows(.id = "outcomes") %>%
+  mutate (type = "run_walk")
+
+error_run <- error_run %>%
+  map (~bind_rows(., .id = "epochs")) %>%
+  bind_rows(.id = "outcomes")%>%
+  mutate (type = "walk_run")
+
+
+
+# X - anterior posterior axis
+#Y - superior axis
+#Z - medial lateral axis
+
+error_df <- bind_rows(error_walk,
+                      error_run) %>%
+  mutate (epochs = factor (epochs, levels = c("25", "50", "100", "200", "500", "1000")),
+         type = factor (type, levels = c("run_walk", "walk_run"))) %>%
+  mutate (outcomes = case_when(
+    outcomes == "Ankle_X_JR" ~ "Ankle AP",
+    outcomes == "Ankle_Y_JR" ~ "Ankle VT",
+    outcomes == "Ankle_Z_JR" ~ "Ankle ML",
+    outcomes == "Knee_X_JR" ~ "Knee AP",
+    outcomes == "Knee_Y_JR" ~ "Knee VT",
+    outcomes == "Knee_Z_JR" ~ "Knee ML",
+    outcomes == "Hip_X_JR" ~ "Hip AP",
+    outcomes == "Hip_Y_JR" ~ "Hip VT",
+    outcomes == "Hip_Z_JR" ~ "Hip ML"
+  )) %>%
+    mutate (outcomes = factor (outcomes, levels = c("Ankle AP", 
+                                                    "Ankle VT",
+                                                    "Ankle ML",
+                                                    "Knee AP",
+                                                    "Knee VT",
+                                                    "Knee ML", 
+                                                    "Hip AP",
+                                                    "Hip VT",
+                                                    "Hip ML")
+                               )
+            )
+
+
+  
+
+
+
+f1 <- ggplot (error_df) +
+  geom_point (aes (x = type, y = RMSE, color = epochs), position=position_dodge(width=0.9)) +
+  scale_color_manual(values = c("#0000FF", "#00EE00", "#FF0000", "#8B6508", "#8B3626", "#FF7F00")) + 
+  facet_wrap(~ outcomes, ncol = 3, scales = "free") +
+  ylab ("RMSE(BW)") +
+  xlab ("Gait") + 
+  cowplot::theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+f2 <- ggplot (error_df) +
+  geom_point (aes (x = type, y = relRMSE, color = epochs), position=position_dodge(width=0.9)) +
+  scale_color_manual(values = c("#0000FF", "#00EE00", "#FF0000", "#8B6508", "#8B3626", "#FF7F00")) + 
+  facet_wrap(~ outcomes, ncol = 3, scales = "free") +
+  ylab ("relRMSE(%)") +
+  xlab ("Gait") + 
+  cowplot::theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+f3 <- ggplot (error_df) +
+  geom_point (aes (x = type, y = cor, color = epochs), position=position_dodge(width=0.9)) +
+  scale_color_manual(values = c("#0000FF", "#00EE00", "#FF0000", "#8B6508", "#8B3626", "#FF7F00")) + 
+  facet_wrap(~ outcomes, ncol = 3, scales = "free") +
+  ylab ("correlation") +
+  xlab ("Gait") + 
+  cowplot::theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+prow <- cowplot::plot_grid(
+  f1 + theme(legend.position="none"),
+  f2 + theme(legend.position="none"),
+  f3 + theme(legend.position="none"),
+  align = 'vh',
+  labels = c("A", "B", "C"),
+  hjust = -1,
+  nrow = 1
+)
+
+legend <- cowplot::get_legend(f1 + theme(legend.box.margin = margin(0, 0, 0, 12)) )
+
+tiff ("output/fig_diff_perf.tiff", units = "in", height = 7, width = 17, res = 100)
+cowplot::plot_grid(prow, legend, rel_widths = c(3, .4))
+dev.off()
+
+export_df <- error_df %>%
+  group_by(outcomes,type) %>%
+  summarise (`Best RMSE` = min (RMSE),
+             `Best reRMSE` = min (relRMSE),
+             `Best correlation` = max (cor)) %>%
+  mutate_if (is.numeric, round, 2) %>%
+  arrange (type)
+
+# writexl::write_xlsx (list( Diff = export_df),
+#                      "manuscript/supp_mat_diff.xlsx")
+```
+
+```{r}
+get_mean <- function (x) {
+  
+  apply (x, 2, mean)
+}
+
+epoch_names <- function (x) {
+  
+  names (x) <- c("25", "50", "100", "200", "500", "1000")
+  x
+  
+}
+
+# Walk
+y_pred_walk <- res2$pred_list_runwalk2
+names(y_pred_walk) <- jr_var
+
+y_pred_walk <- y_pred_walk %>%
+  map (~.x %>% map (~ matrix (unlist(.), length (.), 51, byrow = TRUE))) %>%
+  map (~.x %>% map (~ get_mean(.))) %>%
+  map (~epoch_names (.)) %>%
+  map (~bind_rows(., .id = "epochs")) %>%
+  bind_rows(.id = "outcomes") %>%
+  mutate (cycle = rep (1:51, 9)) %>%
+  pivot_longer(cols = -c(outcomes, cycle),
+               names_to = "epochs",
+               values_to = "JCF") 
+
+# Run
+y_pred_run <- res2$pred_list_walkrun2
+names(y_pred_run) <- jr_var
+
+y_pred_run <- y_pred_run %>%
+  map (~.x %>% map (~ matrix (unlist(.), length (.), 51, byrow = TRUE))) %>%
+  map (~.x %>% map (~ get_mean(.))) %>%
+  map (~epoch_names (.)) %>%
+  map (~bind_rows(., .id = "epochs")) %>%
+  bind_rows(.id = "outcomes") %>%
+  mutate (cycle = rep (1:51, 9)) %>%
+  pivot_longer(cols = -c(outcomes, cycle),
+               names_to = "epochs",
+               values_to = "JCF") 
+
+y_pred_walk <- y_pred_walk %>%
+  mutate (epochs = factor (epochs, levels = c("25", "50", "100", "200", "500", "1000"))) %>%
+  mutate (outcomes = case_when(
+    outcomes == "Ankle_X_JR" ~ "Ankle AP",
+    outcomes == "Ankle_Y_JR" ~ "Ankle VT",
+    outcomes == "Ankle_Z_JR" ~ "Ankle ML",
+    outcomes == "Knee_X_JR" ~ "Knee AP",
+    outcomes == "Knee_Y_JR" ~ "Knee VT",
+    outcomes == "Knee_Z_JR" ~ "Knee ML",
+    outcomes == "Hip_X_JR" ~ "Hip AP",
+    outcomes == "Hip_Y_JR" ~ "Hip VT",
+    outcomes == "Hip_Z_JR" ~ "Hip ML"
+  )) %>%
+    mutate (outcomes = factor (outcomes, levels = c("Ankle AP", 
+                                                    "Ankle VT",
+                                                    "Ankle ML",
+                                                    "Knee AP",
+                                                    "Knee VT",
+                                                    "Knee ML", 
+                                                    "Hip AP",
+                                                    "Hip VT",
+                                                    "Hip ML")
+                               )
+            )
+
+y_pred_run <- y_pred_run %>%
+  mutate (epochs = factor (epochs, levels = c("25", "50", "100", "200", "500", "1000"))) %>%
+  mutate (outcomes = case_when(
+    outcomes == "Ankle_X_JR" ~ "Ankle AP",
+    outcomes == "Ankle_Y_JR" ~ "Ankle VT",
+    outcomes == "Ankle_Z_JR" ~ "Ankle ML",
+    outcomes == "Knee_X_JR" ~ "Knee AP",
+    outcomes == "Knee_Y_JR" ~ "Knee VT",
+    outcomes == "Knee_Z_JR" ~ "Knee ML",
+    outcomes == "Hip_X_JR" ~ "Hip AP",
+    outcomes == "Hip_Y_JR" ~ "Hip VT",
+    outcomes == "Hip_Z_JR" ~ "Hip ML"
+  )) %>%
+    mutate (outcomes = factor (outcomes, levels = c("Ankle AP", 
+                                                    "Ankle VT",
+                                                    "Ankle ML",
+                                                    "Knee AP",
+                                                    "Knee VT",
+                                                    "Knee ML", 
+                                                    "Hip AP",
+                                                    "Hip VT",
+                                                    "Hip ML")
+                               )
+            )
+
+# Test
+
+## Walk
+
+names(test_ave_walk) <- jr_var
+
+test_ave_walk2 <- test_ave_walk %>%
+  map (~bind_rows(., .id = "epochs")) %>%
+  bind_rows(.id = "outcomes") %>%
+  mutate (cycle = rep (1:51, 9)) %>%
+  pivot_longer(cols = -c(outcomes, cycle),
+               names_to = "epochs",
+               values_to = "JCF") %>%
+  group_by(outcomes, cycle) %>%
+  summarise (JCF_o = mean (JCF))%>%
+  mutate (outcomes = case_when(
+    outcomes == "Ankle_X_JR" ~ "Ankle AP",
+    outcomes == "Ankle_Y_JR" ~ "Ankle VT",
+    outcomes == "Ankle_Z_JR" ~ "Ankle ML",
+    outcomes == "Knee_X_JR" ~ "Knee AP",
+    outcomes == "Knee_Y_JR" ~ "Knee VT",
+    outcomes == "Knee_Z_JR" ~ "Knee ML",
+    outcomes == "Hip_X_JR" ~ "Hip AP",
+    outcomes == "Hip_Y_JR" ~ "Hip VT",
+    outcomes == "Hip_Z_JR" ~ "Hip ML"
+  )) %>%
+    mutate (outcomes = factor (outcomes, levels = c("Ankle AP", 
+                                                    "Ankle VT",
+                                                    "Ankle ML",
+                                                    "Knee AP",
+                                                    "Knee VT",
+                                                    "Knee ML", 
+                                                    "Hip AP",
+                                                    "Hip VT",
+                                                    "Hip ML")
+                               )
+            )
+
+## Run
+names(test_ave_run) <- jr_var
+
+test_ave_run2 <- test_ave_run %>%
+  map (~bind_rows(., .id = "epochs")) %>%
+  bind_rows(.id = "outcomes") %>%
+  mutate (cycle = rep (1:51, 9)) %>%
+  pivot_longer(cols = -c(outcomes, cycle),
+               names_to = "epochs",
+               values_to = "JCF")  %>%
+  group_by(outcomes, cycle) %>%
+  summarise (JCF_o = mean (JCF))%>%
+  mutate (outcomes = case_when(
+    outcomes == "Ankle_X_JR" ~ "Ankle AP",
+    outcomes == "Ankle_Y_JR" ~ "Ankle VT",
+    outcomes == "Ankle_Z_JR" ~ "Ankle ML",
+    outcomes == "Knee_X_JR" ~ "Knee AP",
+    outcomes == "Knee_Y_JR" ~ "Knee VT",
+    outcomes == "Knee_Z_JR" ~ "Knee ML",
+    outcomes == "Hip_X_JR" ~ "Hip AP",
+    outcomes == "Hip_Y_JR" ~ "Hip VT",
+    outcomes == "Hip_Z_JR" ~ "Hip ML"
+  )) %>%
+    mutate (outcomes = factor (outcomes, levels = c("Ankle AP", 
+                                                    "Ankle VT",
+                                                    "Ankle ML",
+                                                    "Knee AP",
+                                                    "Knee VT",
+                                                    "Knee ML", 
+                                                    "Hip AP",
+                                                    "Hip VT",
+                                                    "Hip ML")
+                               )
+            )
+
+curve_plot_walk <- y_pred_walk %>%
+  inner_join (test_ave_walk2, by = c("outcomes", "cycle"))
+
+curve_plot_run <- y_pred_run %>%
+  inner_join (test_ave_run2, by = c("outcomes", "cycle"))
+  
+ 
+f1 <- ggplot (curve_plot_walk) +
+  geom_line (aes (x = cycle, y = JCF_o), color = "black") +
+  geom_line (aes (x = cycle, y = JCF, color = epochs)) +
+  scale_color_manual(values = c("#0000FF", "#00EE00", "#FF0000", "#8B6508", "#8B3626", "#FF7F00")) + 
+  facet_wrap( ~ outcomes, scales = "free", ncol = 3) +
+  ylab ("JCF (BW)") +
+  xlab ("Cycle(%)") + 
+  cowplot::theme_cowplot()
+
+f2 <- ggplot (curve_plot_run) +
+  geom_line (aes (x = cycle, y = JCF_o), color = "black") +
+  geom_line (aes (x = cycle, y = JCF, color = epochs)) +
+  scale_color_manual(values = c("#0000FF", "#00EE00", "#FF0000", "#8B6508", "#8B3626", "#FF7F00")) + 
+  facet_wrap( ~ outcomes, scales = "free", ncol = 3) +
+  ylab ("JCF (BW)") +
+  xlab ("Cycle(%)") + 
+  cowplot::theme_cowplot()
+
+
+prow <- cowplot::plot_grid(
+  f1 + theme(legend.position="none"),
+  f2 + theme(legend.position="none"),
+  align = 'vh',
+  labels = c("A", "B"),
+  hjust = -1,
+  nrow = 2
+)
+
+legend <- cowplot::get_legend(f1 + 
+    guides(color = guide_legend(nrow = 1)) +
+    theme(legend.position = "bottom"))
+
+# tiff ("output/fig_diff_curv.tiff", units = "in", height = 15, width = 10, res = 100)
+# cowplot::plot_grid(prow, legend, ncol = 1, rel_heights = c(1, .1))
+# dev.off()
+
+```
+
+# Reporting
+
+```{r}
+error_df %>%
+  group_by(type, outcomes) %>%
+  slice_min (RMSE) %>%
+  group_by(type, epochs) %>%
+  count(epochs)
+
+error_df %>%
+  group_by(type, outcomes) %>%
+  mutate (diff = lag (RMSE)) %>%
+  slice_max (diff) %>%
+  group_by(type) %>%
+  count(epochs)
+
+
+error_df %>%
+  group_by(type, outcomes) %>%
+  slice_min (RMSE)%>%
+  group_by(type) %>%
+  slice_min (RMSE)
+
+ error_df %>%
+  group_by(type, outcomes) %>%
+  slice_min (RMSE)%>%
+  group_by(type) %>%
+  slice_max (RMSE)
+ 
+error_df %>%
+  mutate (plane = str_remove_all(outcomes, "Ankle |Knee |Hip ")) %>%
+  group_by(type, plane) %>%
+  summarise (Mean = mean (RMSE),
+             Sd = sd (RMSE))
+
+error_df %>%
+  mutate (plane = str_remove_all(outcomes, "Ankle |Knee |Hip ")) %>%
+  group_by(type, plane) %>%
+  summarise (Mean = mean (relRMSE),
+             Sd = sd (relRMSE))
+
+
+```
