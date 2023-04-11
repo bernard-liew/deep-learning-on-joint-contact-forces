@@ -533,7 +533,7 @@ prow <- cowplot::plot_grid(
 
 legend <- cowplot::get_legend(f1 + theme(legend.box.margin = margin(0, 0, 0, 12)) )
 
-tiff ("output/fig_diff_perf.tiff", units = "in", height = 7, width = 17, res = 100)
+tiff ("manuscript/fig6_diff_perf.tiff", units = "in", height = 7, width = 17, res = 100)
 cowplot::plot_grid(prow, legend, rel_widths = c(3, .4))
 dev.off()
 
@@ -545,8 +545,8 @@ export_df <- error_df %>%
   mutate_if (is.numeric, round, 2) %>%
   arrange (type)
 
-# writexl::write_xlsx (list( Diff = export_df),
-#                      "manuscript/supp_mat_diff.xlsx")
+writexl::write_xlsx (list( Diff = export_df),
+                     "manuscript/supp_mat_diff.xlsx")
 ```
 
 ```{r}
@@ -754,9 +754,9 @@ legend <- cowplot::get_legend(f1 +
     guides(color = guide_legend(nrow = 1)) +
     theme(legend.position = "bottom"))
 
-# tiff ("output/fig_diff_curv.tiff", units = "in", height = 15, width = 10, res = 100)
-# cowplot::plot_grid(prow, legend, ncol = 1, rel_heights = c(1, .1))
-# dev.off()
+tiff ("manuscript/fig3_diff_curv.tiff", units = "in", height = 15, width = 10, res = 100)
+cowplot::plot_grid(prow, legend, ncol = 1, rel_heights = c(1, .1))
+dev.off()
 
 ```
 
